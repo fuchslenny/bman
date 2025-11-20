@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""
+bman - Professional Man Pages for Sysadmins
+A clean, focused alternative to man with clear hierarchy and easy navigation.
+Optimized for long CLI sessions with eye-friendly colors and smart highlighting.
+"""
+
+import sys
+import subprocess
+import re
+import argparse
+import curses
+from typing import List, Tuple, Optional
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
+    from rich.table import Table
+    from rich.style import Style
+except ImportError:
+    print("❌ Error: 'rich' library is required.")
+    print("   Install it with: pip install rich --break-system-packages")
+    sys.exit(1)
+
+
+class InteractiveViewer:
+    """Interactive viewer with scrolling, search, and navigation"""
+    
+    def __init__(self, lines: List[Tuple[str, int, bool]], title: str):
+        """
+        Initialize viewer
+        lines: List of (text, color_pair, is_bold) tuples
+        title: Title to display at top
+        """
+        self.lines = lines
+        self.title = title
+        self.current_line = 0
+        self.search_term = ""
+        self.search_results = []
+        self.current_search_index = -1
+        self.status_message = ""
+        self.show_help = False
+        
+    def init_colors(self):
+        """Initialize professional color pairs optimized for sysadmin readability"""
+        curses.start_color()
+        curses.use_default_colors()
+        
+        # Check if terminal supports 256 colors
+        max_colors = curses.COLORS
+        
+        if max_colors >= 256:
+            # Professional palette - easy on the eyes, clear hierarchy
+            # Using muted, high-contrast colors optimized for long reading sessions
+            curses.init_pair(1, 14, -1)           # Cyan (not too bright) - Section headers
+            curses.init_pair(2, 10, -1)           # Green (readable) - Options/Flags
+            curses.init_pair(3, 11, -1)           # Yellow (muted) - Commands/Examples
+            curses.init_pair(4, 250, -1)          # Light Gray - Normal text (better than pure white)
+            curses.init_pair(5, 244, -1)          # Dark Gray - Less important text
+            curses.init_pair(6, 9, -1)            # Red (muted) - Warnings/Important
+            curses.init_pair(7, 0, 11)            # Black on Yellow - Search highlight
+            curses.init_pair(8, 0, 14)            # Black on Cyan - Status bar
+        else:
+            # Fallback 8-color scheme
+            curses.init_pair(1, curses.COLOR_CYAN, -1)      # Section headers
+            curses.init_pair(2, curses.COLOR_GREEN, -1)     # Options/Flags
+            curses.init_pair(3, curses.COLOR_YELLOW, -1)    # Commands/Examples
+            curses.init_pair(4, curses.COLOR_WHITE, -1)     # Normal text
+            curses.init_pair(5, curses.COLOR_WHITE, -1)     # Less important (no dim in 8-color)
+            curses.init_pair(6, curses.COLOR_RED, -1)       # Warnings/Important
+            curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_YELLOW)  # Search highlight
+            curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_CYAN)    # Status bar
+        
+    def draw_help(self, stdscr):
+        """Draw help overlay"""
+        height, width = stdscr.getmaxyx()
+        
+        help_lines = [
+            "",
+            "╔═══════════════════════════════════════════════════════╗",
+            "║              bman - Keyboard Shortcuts               ║",
+            "╠═══════════════════════════════════════════════════════╣",
+            "║  Navigation:                                          ║",
+            "║    q / Q / Esc    - Quit viewer                       ║",
+            "║    ↑ / k          - Scroll up one line                ║",
+            "║    ↓ / j          - Scroll down one line              ║",
+            "║    PgUp / b / u   - Page up                           ║",
+            "║    PgDn / Space   - Page down                         ║",
+            "║    g / Home       - Go to top                         ║",
+            "║    G / End        - Go to bottom                      ║",
+            "║                                                        ║",
+            "║  Search:                                              ║",
+            "║    /              - Search forward                    ║",
+            "║    ?              - Search backward                   ║",
+            "║    n              - Next search result                ║",
+            "║    N              - Previous search result            ║",
+            "║                                                        ║",
+            "║  Other:                                               ║",
+            "║    h / F1         - Toggle this help                  ║",
+            "╚═══════════════════════════════════════════════════════╝",
+            "",
+            "              Press any key to close help..."
+        ]
+        
+        start_y = max(0, (height - len(help_lines)) // 2)
+        start_x = max(0, (width - 60) // 2)
+        
+        stdscr.clear()
+        for i, line in enumerate(help_lines):
+            y = start_y + i
+            if y < height - 1:
+                try:
+                    if "bman" in line:
+                        stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                        stdscr.addstr(y, start_x, line[:min(len(line), width - start_x - 1)])
+                        stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                    else:
+                        stdscr.addstr(y, start_x, line[:min(len(line), width - start_x - 1)])
+                except:
+                    pass
+        
+        stdscr.refresh()
+        stdscr.getch()
+        self.show_help = False
+    
+    def search(self, stdscr, forward=True):
+        """Search for text in the content"""
+        if not self.search_term:
+            # Prompt for search term
+            curses.echo()
+            curses.curs_set(1)
+            stdscr.attron(curses.color_pair(5))
+            stdscr.addstr(curses.LINES - 1, 0, "Search: " if forward else "Search backward: ")
+            stdscr.clrtoeol()
+            stdscr.attroff(curses.color_pair(5))
+            stdscr.refresh()
+            
+            try:
+                search_input = stdscr.getstr(curses.LINES - 1, 16, 50).decode('utf-8')
+            except:
+                search_input = ""
+            
+            curses.noecho()
+            curses.curs_set(0)
+            
+            if not search_input:
+                return
+            
+            self.search_term = search_input
+            
+            # Find all occurrences
+            self.search_results = []
+            for i, (line, _, _) in enumerate(self.lines):
+                if self.search_term.lower() in line.lower():
+                    self.search_results.append(i)
+            
+            if not self.search_results:
+                self.status_message = f"Pattern not found: {self.search_term}"
+                return
+            
+            self.current_search_index = 0
+            self.current_line = self.search_results[0]
+            self.status_message = f"Found {len(self.search_results)} matches"
+        else:
+            # Navigate to next/previous match
+            if not self.search_results:
+                self.status_message = f"Pattern not found: {self.search_term}"
+                return
+            
+            if forward:
+                self.current_search_index = (self.current_search_index + 1) % len(self.search_results)
+            else:
+                self.current_search_index = (self.current_search_index - 1) % len(self.search_results)
+            
+            self.current_line = self.search_results[self.current_search_index]
+            self.status_message = f"Match {self.current_search_index + 1}/{len(self.search_results)}"
+    
+    def draw_status_bar(self, stdscr):
+        """Draw modern status bar at bottom"""
+        height, width = stdscr.getmaxyx()
+        
+        # Calculate percentage
+        if len(self.lines) > height - 3:
+            percentage = int((self.current_line / max(1, len(self.lines) - height + 3)) * 100)
+            percentage = min(100, max(0, percentage))
+        else:
+            percentage = 100
+        
+        # Create progress bar
+        bar_width = 20
+        filled = int((percentage / 100) * bar_width)
+        progress_bar = "█" * filled + "░" * (bar_width - filled)
+        
+        # Status components
+        if self.status_message:
+            left_status = self.status_message
+            self.status_message = ""
+        else:
+            left_status = f"Line {self.current_line + 1}/{len(self.lines)}"
+        
+        center_status = f"[{progress_bar}] {percentage}%"
+        right_status = "? help"
+        
+        # Calculate spacing
+        total_len = len(left_status) + len(center_status) + len(right_status) + 4
+        if total_len > width - 2:
+            # Simplified version for narrow terminals
+            status = f"{left_status} {percentage}%"[:width - 2]
+        else:
+            # Calculate proper spacing
+            remaining_space = width - 2 - total_len
+            padding = " " * max(1, remaining_space // 2)
+            status = f"{left_status}{padding}{center_status}{padding}{right_status}"
+        
+        # Draw status bar
+        try:
+            stdscr.attron(curses.color_pair(8) | curses.A_BOLD)
+            stdscr.addstr(height - 1, 0, " " + status.ljust(width - 2) + " ")
+            stdscr.attroff(curses.color_pair(8) | curses.A_BOLD)
+        except:
+            pass
+    
+    def draw_title_bar(self, stdscr, width):
+        """Draw modern title bar"""
+        try:
+            # Create decorative title (without emoji for width calculation safety)
+            title_text = f" {self.title} "
+            
+            # Center the title
+            if len(title_text) > width - 4:
+                # Title too long, truncate
+                title_text = " " + self.title[:width-7] + "... "
+            
+            padding_len = (width - len(title_text)) // 2
+            padding = "═" * padding_len
+            full_title = f"{padding}{title_text}{padding}"
+            
+            # Adjust if not perfectly centered
+            if len(full_title) < width:
+                full_title += "═" * (width - len(full_title))
+            elif len(full_title) > width:
+                full_title = full_title[:width]
+            
+            stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addstr(0, 0, full_title)
+            stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+        except:
+            pass
+    
+    def draw_content(self, stdscr):
+        """Draw the content with current scroll position"""
+        if self.show_help:
+            self.draw_help(stdscr)
+            return
+        
+        height, width = stdscr.getmaxyx()
+        stdscr.clear()
+        
+        # Draw title bar
+        self.draw_title_bar(stdscr, width)
+        
+        # Draw separator
+        try:
+            stdscr.attron(curses.color_pair(1))
+            stdscr.addstr(1, 0, "─" * width)
+            stdscr.attroff(curses.color_pair(1))
+        except:
+            pass
+        
+        # Draw content
+        visible_lines = height - 3  # Reserve space for title, separator, and status
+        start_line = self.current_line
+        end_line = min(start_line + visible_lines, len(self.lines))
+        
+        for i in range(start_line, end_line):
+            line_text, color, is_bold = self.lines[i]
+            y_pos = i - start_line + 2  # Start after title and separator
+            
+            if y_pos >= height - 1:
+                break
+            
+            # Add scroll indicator
+            if i == start_line and start_line > 0:
+                try:
+                    stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                    stdscr.addstr(y_pos, width - 3, "▲")
+                    stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                except:
+                    pass
+            elif i == end_line - 1 and end_line < len(self.lines):
+                try:
+                    stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                    stdscr.addstr(y_pos, width - 3, "▼")
+                    stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                except:
+                    pass
+            
+            # Truncate line if too long
+            if len(line_text) > width - 5:
+                line_text = line_text[:width - 8] + "..."
+            
+            try:
+                # Check if this line contains search term
+                is_search_result = i in self.search_results if self.search_results else False
+                
+                if is_search_result and self.search_term:
+                    # Highlight search term
+                    parts = re.split(f'({re.escape(self.search_term)})', line_text, flags=re.IGNORECASE)
+                    x_pos = 0
+                    for part in parts:
+                        if part.lower() == self.search_term.lower():
+                            stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+                            stdscr.addstr(y_pos, x_pos, part)
+                            stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+                        else:
+                            attrs = curses.color_pair(color)
+                            if is_bold:
+                                attrs |= curses.A_BOLD
+                            stdscr.attron(attrs)
+                            stdscr.addstr(y_pos, x_pos, part)
+                            stdscr.attroff(attrs)
+                        x_pos += len(part)
+                else:
+                    # Normal display
+                    attrs = curses.color_pair(color)
+                    if is_bold:
+                        attrs |= curses.A_BOLD
+                    stdscr.attron(attrs)
+                    stdscr.addstr(y_pos, 0, line_text)
+                    stdscr.attroff(attrs)
+            except:
+                pass
+        
+        # Draw status bar
+        self.draw_status_bar(stdscr)
+        stdscr.refresh()
+    
+    def run(self, stdscr):
+        """Main loop for interactive viewer"""
+        self.init_colors()
+        curses.curs_set(0)  # Hide cursor
+        stdscr.keypad(True)  # Enable keypad mode
+        
+        height, width = stdscr.getmaxyx()
+        
+        while True:
+            self.draw_content(stdscr)
+            
+            try:
+                key = stdscr.getch()
+            except KeyboardInterrupt:
+                break
+            
+            # Navigation keys
+            if key in (ord('q'), ord('Q'), 27):  # q, Q, or ESC
+                break
+            elif key in (curses.KEY_UP, ord('k')):
+                self.current_line = max(0, self.current_line - 1)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                self.current_line = min(len(self.lines) - 1, self.current_line + 1)
+            elif key in (curses.KEY_PPAGE, ord('b'), ord('u')):  # Page Up
+                self.current_line = max(0, self.current_line - height + 3)
+            elif key in (curses.KEY_NPAGE, ord(' '), ord('f')):  # Page Down
+                self.current_line = min(len(self.lines) - 1, self.current_line + height - 3)
+            elif key in (ord('g'), curses.KEY_HOME):
+                self.current_line = 0
+            elif key in (ord('G'), curses.KEY_END):
+                self.current_line = max(0, len(self.lines) - height + 3)
+            elif key == ord('/'):  # Search forward
+                self.search(stdscr, forward=True)
+            elif key == ord('?'):  # Search backward
+                self.search(stdscr, forward=False)
+            elif key == ord('n'):  # Next search result
+                if self.search_term:
+                    self.search(stdscr, forward=True)
+            elif key == ord('N'):  # Previous search result
+                if self.search_term:
+                    self.search(stdscr, forward=False)
+            elif key in (ord('h'), curses.KEY_F1):  # Help
+                self.show_help = True
+
+
+class ManPageParser:
+    """Parser for man pages with professional, focused formatting"""
+    
+    SECTION_HEADERS = {
+        'NAME', 'SYNOPSIS', 'DESCRIPTION', 'OPTIONS', 'EXAMPLES', 'SEE ALSO',
+        'AUTHOR', 'AUTHORS', 'COPYRIGHT', 'BUGS', 'FILES', 'NOTES', 'ENVIRONMENT',
+        'EXIT STATUS', 'RETURN VALUE', 'ERRORS', 'VERSIONS', 'CONFORMING TO',
+        'HISTORY', 'SECURITY', 'CAVEATS', 'STANDARDS', 'AVAILABILITY'
+    }
+    
+    def __init__(self):
+        self.console = Console()
+    
+    def get_man_content(self, command: str, section: str = None) -> Optional[str]:
+        """Get raw man page content"""
+        try:
+            cmd = ['man']
+            if section:
+                cmd.append(section)
+            cmd.append(command)
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, env={'MANWIDTH': '100'})
+            
+            if result.returncode != 0:
+                return None
+            
+            return result.stdout
+        except Exception:
+            return None
+    
+    def parse_sections(self, content: str) -> List[Tuple[str, str]]:
+        """Parse man page into sections"""
+        lines = content.split('\n')
+        sections = []
+        current_section = "PREAMBLE"
+        current_content = []
+        
+        for line in lines:
+            # Check if line is a section header
+            stripped = line.strip()
+            if stripped and stripped.isupper() and stripped in self.SECTION_HEADERS:
+                # Save previous section
+                if current_content:
+                    sections.append((current_section, '\n'.join(current_content)))
+                
+                # Start new section
+                current_section = stripped
+                current_content = []
+            else:
+                current_content.append(line)
+        
+        # Add last section
+        if current_content:
+            sections.append((current_section, '\n'.join(current_content)))
+        
+        return sections
+    
+    def clean_formatting(self, text: str) -> str:
+        """Remove man page formatting codes"""
+        # Remove backspace formatting (bold/underline)
+        text = re.sub(r'.\x08', '', text)
+        # Remove excessive whitespace
+        text = re.sub(r'\n\n\n+', '\n\n', text)
+        return text
+    
+    def format_line_advanced(self, line: str) -> Tuple[str, int, bool]:
+        """
+        Professional formatting focused on readability and hierarchy
+        Colors: 1=Cyan, 2=Green, 3=Yellow, 4=Light Gray, 5=Dark Gray, 6=Red
+        Returns: (text, color_pair, is_bold)
+        
+        Hierarchy:
+        - Level 1: Section Headers (Cyan + Bold)
+        - Level 2: Options/Commands (Green/Yellow + Bold)
+        - Level 3: Normal text (Light Gray)
+        - Level 4: Dimmed details (Dark Gray)
+        """
+        line = self.clean_formatting(line)
+        stripped = line.strip()
+        
+        # Level 1: Section headers - Most important
+        if stripped and stripped.isupper() and stripped in self.SECTION_HEADERS:
+            return (line, 1, True)  # Cyan + Bold
+        
+        # Level 2A: Command-line options (most important for sysadmins)
+        # Match: -o, --option, --option=VALUE, --option VALUE
+        if re.match(r'^\s+--?[a-zA-Z0-9]', line):
+            # Check if it's a main option line (bold) vs description (normal)
+            if re.match(r'^\s{0,8}--?', line):  # Main option (less indented)
+                return (line, 2, True)   # Green + Bold
+            else:
+                return (line, 2, False)  # Green + Normal
+        
+        # Level 2B: Command examples - Critical for learning
+        # Match: $ command, # command (shell prompts)
+        if re.match(r'^\s+[$#]\s+\w', line):
+            return (line, 3, True)  # Yellow + Bold
+        
+        # Level 2C: Code blocks (heavily indented lines with content)
+        if re.match(r'^\s{8,}\S', line):
+            return (line, 3, False)  # Yellow + Normal
+        
+        # Level 3: Important inline information
+        # Warnings and notes that need attention
+        if re.match(r'^\s*(Note|Warning|Important|Error|Caution):', line, re.IGNORECASE):
+            return (line, 6, True)  # Red + Bold
+        
+        # Level 4: Dimmed text - Less important
+        # Optional parameters in brackets
+        if stripped.startswith('[') and stripped.endswith(']'):
+            return (line, 5, False)  # Dark Gray + Normal
+        
+        # SEE ALSO references - don't need much attention
+        if re.search(r'\b[a-z_-]+\([0-9]\)', line):
+            return (line, 5, False)  # Dark Gray + Normal
+        
+        # Default: Normal text - Most content
+        return (line, 4, False)  # Light Gray + Normal
+    
+    def prepare_formatted_lines(self, sections: List[Tuple[str, str]], 
+                                search_term: str = None) -> List[Tuple[str, int, bool]]:
+        """Prepare all lines with color codes and bold flags"""
+        formatted_lines = []
+        
+        # Filter by search term if provided
+        if search_term:
+            sections = [(title, content) for title, content in sections 
+                       if search_term.lower() in content.lower() or 
+                          search_term.lower() in title.lower()]
+        
+        for title, content in sections:
+            if title == "PREAMBLE":
+                continue
+            
+            # Clean, professional section header
+            # No fancy boxes - just clear visual separation
+            formatted_lines.append(("", 4, False))
+            formatted_lines.append(("─" * 80, 1, False))
+            formatted_lines.append((f"  {title}", 1, True))
+            formatted_lines.append(("─" * 80, 1, False))
+            formatted_lines.append(("", 4, False))
+            
+            # Add content lines with professional formatting
+            for line in content.split('\n'):
+                formatted_line, color, is_bold = self.format_line_advanced(line)
+                formatted_lines.append((formatted_line, color, is_bold))
+        
+        # Add empty lines at the end for better scrolling
+        for _ in range(5):
+            formatted_lines.append(("", 6, False))
+        
+        return formatted_lines
+    
+    def display_interactive(self, command: str, section: str = None, search: str = None):
+        """Display man page in interactive viewer"""
+        # Get man page content
+        content = self.get_man_content(command, section)
+        
+        if content is None:
+            self.console.print(f"\n[bold red]No manual entry for[/bold red] [cyan]{command}[/cyan]\n")
+            
+            # Try to suggest similar commands
+            try:
+                result = subprocess.run(['apropos', command], capture_output=True, text=True)
+                if result.stdout:
+                    self.console.print("[bold yellow]Similar commands:[/bold yellow]\n")
+                    for line in result.stdout.split('\n')[:5]:
+                        if line.strip():
+                            self.console.print(f"  [cyan]>[/cyan] {line}")
+                    self.console.print()
+            except:
+                pass
+            
+            return
+        
+        # Parse sections
+        sections = self.parse_sections(content)
+        
+        # Prepare formatted lines
+        formatted_lines = self.prepare_formatted_lines(sections, search)
+        
+        if search and not formatted_lines:
+            self.console.print(f"[bold red]No results found for[/bold red] [yellow]'{search}'[/yellow]")
+            return
+        
+        # Create title
+        title = f"{command}"
+        if section:
+            title += f" ({section})"
+        if search:
+            title += f" [search: {search}]"
+        
+        # Launch interactive viewer
+        viewer = InteractiveViewer(formatted_lines, title)
+        try:
+            curses.wrapper(viewer.run)
+        except KeyboardInterrupt:
+            pass
+
+
+def list_commands(search_term: str = None):
+    """List available man pages with clean, professional formatting"""
+    console = Console()
+    
+    try:
+        cmd = ['apropos', search_term if search_term else '.']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.stdout:
+            # Create header
+            title = f"Available Commands"
+            if search_term:
+                title += f" matching '{search_term}'"
+            
+            console.print(f"\n[bold cyan]{title}[/bold cyan]\n")
+            
+            # Parse and display results
+            lines = result.stdout.strip().split('\n')
+            
+            # Create a table for better organization
+            table = Table(show_header=True, header_style="bold cyan", box=box.ROUNDED)
+            table.add_column("Command", style="cyan", no_wrap=True)
+            table.add_column("Section", style="dim", width=8)
+            table.add_column("Description", style="white")
+            
+            count = 0
+            for line in lines[:50]:
+                if line.strip():
+                    match = re.match(r'^(\S+)\s*\((\d+)\)\s*-\s*(.+)$', line)
+                    if match:
+                        cmd_name, section, description = match.groups()
+                        # Truncate long descriptions
+                        if len(description) > 80:
+                            description = description[:77] + "..."
+                        table.add_row(cmd_name, section, description)
+                        count += 1
+            
+            console.print(table)
+            
+            if len(lines) > 50:
+                console.print(f"\n[dim]... and {len(lines) - 50} more results (use bman -l <term> to filter)[/dim]\n")
+            else:
+                console.print()
+        else:
+            console.print("[yellow]No matching commands found[/yellow]")
+            
+    except Exception as e:
+        console.print(f"[red]Error listing commands: {e}[/red]")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='bman - Professional Man Pages for Sysadmins\n' +
+                    'Clean, focused, easy-to-read documentation viewer',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  bman ls                    # Display ls man page (interactive)
+  bman ls 1                  # Display ls man page from section 1
+  bman ls -s "sort"          # Search for "sort" in ls man page
+  bman -l git                # List all commands containing "git"
+  bman --list                # List all available commands
+
+Interactive Controls:
+  q / Q / Esc   - Quit viewer
+  ↑ / k         - Scroll up one line
+  ↓ / j         - Scroll down one line
+  PgUp / b / u  - Page up
+  PgDn / Space  - Page down
+  g / Home      - Go to top
+  G / End       - Go to bottom
+  /             - Search forward
+  ?             - Search backward
+  n             - Next search result
+  N             - Previous search result
+  h / F1        - Show help
+
+Professional design optimized for long CLI sessions
+        """
+    )
+    
+    parser.add_argument('command', nargs='?', help='Command to display man page for')
+    parser.add_argument('section', nargs='?', help='Manual section number')
+    parser.add_argument('-s', '--search', help='Search for term within man page')
+    parser.add_argument('-l', '--list', nargs='?', const='', metavar='TERM',
+                       help='List available man pages (optionally filter by term)')
+    parser.add_argument('--version', action='version', version='bman 3.1.0 - Professional Edition')
+    
+    args = parser.parse_args()
+    
+    # Handle list mode
+    if args.list is not None:
+        list_commands(args.list if args.list else None)
+        return
+    
+    # Require command if not in list mode
+    if not args.command:
+        parser.print_help()
+        return
+    
+    # Display man page interactively
+    man_parser = ManPageParser()
+    man_parser.display_interactive(args.command, args.section, args.search)
+
+
+if __name__ == '__main__':
+    main()
