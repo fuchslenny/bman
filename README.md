@@ -248,28 +248,6 @@ bman bman
 4. **Fokus auf Aktion** - Was kann ich tun? (Options, Examples)
 5. **Professional** - Sieht aus wie ein Tool, nicht wie ein Toy
 
-## 📜 Lizenz
-
-MIT License - Frei verwendbar und modifizierbar
-
-## 👨‍💻 Entwicklung
-
-**Version:** 3.0.0 - Beautiful Edition
-
-Features dieser Version:
-- ✨ Komplett überarbeitetes Farbschema
-- 🎨 Moderne UI mit Unicode-Boxen
-- 🔍 Verbesserte Suche mit Highlighting
-- ⌨️ Erweiterte Tastenkombinationen
-- 📊 Fortschrittsbalken in Status-Bar
-- 🎯 Hilfe-Overlay
-- 🚀 Scroll-Indikatoren
-- 💎 14 verschiedene Farb-Kategorien
-
-## 🤝 Beitragen
-
-Feedback und Verbesserungsvorschläge sind willkommen!
-
 ---
 
 **Made with ❤️ for beautiful documentation**
